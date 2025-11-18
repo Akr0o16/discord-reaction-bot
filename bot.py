@@ -16,16 +16,15 @@ with open("config.json", "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
 ROLE_MESSAGE_ID = int(CONFIG["ROLE_MESSAGE_ID"])
-EMOJI_ROLE_MAP = CONFIG["EMOJI_ROLE_MAP"]  # { "🎮": "Gaming", ... }
+EMOJI_ROLE_MAP = CONFIG["EMOJI_ROLE_MAP"]  # { "🎮": 1439..., ... }
 
-# Optional: Log-Channel und Status-Text
 LOG_CHANNEL_ID = int(CONFIG.get("LOG_CHANNEL_ID", 0))  # 0 = deaktiviert
 STATUS_TEXT = CONFIG.get("STATUS_TEXT", "verwaltet Rollen auf dem Server")
 
 # --- Intents ---
 intents = discord.Intents.default()
-intents.members = True          # Rollen vergeben/entfernen
-intents.message_content = True  # für Commands wie !ping
+intents.members = True
+intents.message_content = True
 intents.guilds = True
 intents.reactions = True
 
@@ -33,7 +32,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 def get_log_channel() -> discord.TextChannel | None:
-    """Gibt den Log-Channel zurück, falls konfiguriert und im Cache."""
     if LOG_CHANNEL_ID == 0:
         return None
     channel = bot.get_channel(LOG_CHANNEL_ID)
@@ -43,7 +41,6 @@ def get_log_channel() -> discord.TextChannel | None:
 
 
 async def log_to_channel(message: str):
-    """Optional: Log auch in einen Discord-Channel schreiben."""
     channel = get_log_channel()
     if channel is None:
         return
@@ -68,13 +65,11 @@ async def on_ready():
     except Exception as e:
         logging.error(f"Konnte Präsenz nicht setzen: {e}")
 
-    # Optional: Meldung im Log-Channel
     await log_to_channel(f"✅ Bot gestartet: {bot.user} ist bereit.")
 
 
 @bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    """Rolle vergeben, wenn jemand reagiert."""
     logging.info(
         f"on_raw_reaction_add: msg={payload.message_id}, "
         f"emoji={payload.emoji}, user={payload.user_id}, guild={payload.guild_id}"
@@ -91,17 +86,22 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
 
     emoji_str = str(payload.emoji)
-    role_name = EMOJI_ROLE_MAP.get(emoji_str)
-    if role_name is None:
+    role_id = EMOJI_ROLE_MAP.get(emoji_str)
+    if role_id is None:
         logging.info(f"Kein Mapping für Emoji {emoji_str}.")
         return
 
-    role = discord.utils.get(guild.roles, name=role_name)
-    if role is None:
-        logging.warning(f"Rolle '{role_name}' nicht gefunden.")
+    try:
+        role_id_int = int(role_id)
+    except ValueError:
+        logging.error(f"Ungültige Rollen-ID in EMOJI_ROLE_MAP für {emoji_str}: {role_id}")
         return
 
-    # Member ermitteln
+    role = guild.get_role(role_id_int)
+    if role is None:
+        logging.warning(f"Rolle mit ID {role_id_int} nicht gefunden.")
+        return
+
     member = payload.member or guild.get_member(payload.user_id)
     if member is None:
         logging.warning(f"Member {payload.user_id} nicht gefunden.")
@@ -124,7 +124,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 @bot.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    """Rolle entfernen, wenn jemand die Reaktion entfernt."""
     logging.info(
         f"on_raw_reaction_remove: msg={payload.message_id}, "
         f"emoji={payload.emoji}, user={payload.user_id}, guild={payload.guild_id}"
@@ -141,14 +140,20 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         return
 
     emoji_str = str(payload.emoji)
-    role_name = EMOJI_ROLE_MAP.get(emoji_str)
-    if role_name is None:
+    role_id = EMOJI_ROLE_MAP.get(emoji_str)
+    if role_id is None:
         logging.info(f"Kein Mapping für Emoji {emoji_str}.")
         return
 
-    role = discord.utils.get(guild.roles, name=role_name)
+    try:
+        role_id_int = int(role_id)
+    except ValueError:
+        logging.error(f"Ungültige Rollen-ID in EMOJI_ROLE_MAP für {emoji_str}: {role_id}")
+        return
+
+    role = guild.get_role(role_id_int)
     if role is None:
-        logging.warning(f"Rolle '{role_name}' nicht gefunden.")
+        logging.warning(f"Rolle mit ID {role_id_int} nicht gefunden.")
         return
 
     member = guild.get_member(payload.user_id)
@@ -172,7 +177,6 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 
 @bot.command()
 async def ping(ctx: commands.Context):
-    """Check, ob der Bot reagiert."""
     await ctx.send("Pong!")
 
 
@@ -181,11 +185,16 @@ async def ping(ctx: commands.Context):
 async def setup_roles(ctx: commands.Context):
     """
     Sendet eine neue Rollen-Nachricht inkl. Reaktionen.
-    Die ID musst du danach manuell in config.json eintragen oder via !reload_roles neu laden.
+    Die ID musst du danach in config.json eintragen (ROLE_MESSAGE_ID) und !reload_roles ausführen.
     """
     description_lines = []
-    for emoji, role_name in EMOJI_ROLE_MAP.items():
-        description_lines.append(f"{emoji} → {role_name}")
+    for emoji, role_id in EMOJI_ROLE_MAP.items():
+        try:
+            role_id_int = int(role_id)
+        except ValueError:
+            continue
+        # Rolle im Text als Mention anzeigen
+        description_lines.append(f"{emoji} → <@&{role_id_int}>")
     description = "\n".join(description_lines)
 
     embed = discord.Embed(
@@ -226,7 +235,6 @@ async def reload_roles(ctx: commands.Context):
         LOG_CHANNEL_ID = int(CONFIG.get("LOG_CHANNEL_ID", 0))
         STATUS_TEXT = CONFIG.get("STATUS_TEXT", "verwaltet Rollen auf dem Server")
 
-        # Präsenz neu setzen
         try:
             await bot.change_presence(
                 activity=discord.Game(name=STATUS_TEXT)
