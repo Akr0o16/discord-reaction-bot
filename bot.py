@@ -2,12 +2,13 @@ import os
 import json
 import logging
 import threading
+import asyncio
 
 import discord
 from discord.ext import commands
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Form
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 import uvicorn
 
 # --- Logging ---
@@ -21,7 +22,7 @@ with open("config.json", "r", encoding="utf-8") as f:
     CONFIG = json.load(f)
 
 ROLE_MESSAGE_ID = int(CONFIG["ROLE_MESSAGE_ID"])
-EMOJI_ROLE_MAP = CONFIG["EMOJI_ROLE_MAP"]  # { "🎮": 1439..., ... }
+EMOJI_ROLE_MAP = CONFIG["EMOJI_ROLE_MAP"]  # { "🎮": "1439...", ... }
 
 LOG_CHANNEL_ID = int(CONFIG.get("LOG_CHANNEL_ID", 0))  # 0 = deaktiviert
 STATUS_TEXT = CONFIG.get("STATUS_TEXT", "verwaltet Rollen auf dem Server")
@@ -64,6 +65,38 @@ def check_dashboard_key(key: str | None):
     """Einfacher Zugriffsschutz für das Dashboard."""
     if DASHBOARD_SECRET and key != DASHBOARD_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def save_config():
+    """CONFIG + Mapping zurück in config.json schreiben."""
+    CONFIG["ROLE_MESSAGE_ID"] = str(ROLE_MESSAGE_ID)
+    CONFIG["EMOJI_ROLE_MAP"] = EMOJI_ROLE_MAP
+    CONFIG["LOG_CHANNEL_ID"] = str(LOG_CHANNEL_ID)
+    CONFIG["STATUS_TEXT"] = STATUS_TEXT
+    with open("config.json", "w", encoding="utf-8") as f:
+        json.dump(CONFIG, f, ensure_ascii=False, indent=4)
+
+
+async def reload_config_internal():
+    """Konfiguration aus Datei neu laden (für Command & Dashboard)."""
+    global CONFIG, ROLE_MESSAGE_ID, EMOJI_ROLE_MAP, LOG_CHANNEL_ID, STATUS_TEXT
+
+    with open("config.json", "r", encoding="utf-8") as f:
+        CONFIG = json.load(f)
+
+    ROLE_MESSAGE_ID = int(CONFIG["ROLE_MESSAGE_ID"])
+    EMOJI_ROLE_MAP = CONFIG["EMOJI_ROLE_MAP"]
+    LOG_CHANNEL_ID = int(CONFIG.get("LOG_CHANNEL_ID", 0))
+    STATUS_TEXT = CONFIG.get("STATUS_TEXT", "verwaltet Rollen auf dem Server")
+
+    try:
+        await bot.change_presence(activity=discord.Game(name=STATUS_TEXT))
+    except Exception as e:
+        logging.error(f"Konnte Präsenz nach reload nicht setzen: {e}")
+
+    msg = "Config neu geladen. ROLE_MESSAGE_ID, EMOJI_ROLE_MAP, LOG_CHANNEL_ID und STATUS_TEXT aktualisiert."
+    logging.info(msg)
+    await log_to_channel(f"🔁 {msg}")
 
 
 # --- Discord Events ---
@@ -239,28 +272,9 @@ async def reload_roles(ctx: commands.Context):
     """
     Lädt config.json neu (ROLE_MESSAGE_ID, EMOJI_ROLE_MAP, LOG_CHANNEL_ID, STATUS_TEXT).
     """
-    global CONFIG, ROLE_MESSAGE_ID, EMOJI_ROLE_MAP, LOG_CHANNEL_ID, STATUS_TEXT
-
     try:
-        with open("config.json", "r", encoding="utf-8") as f:
-            CONFIG = json.load(f)
-
-        ROLE_MESSAGE_ID = int(CONFIG["ROLE_MESSAGE_ID"])
-        EMOJI_ROLE_MAP = CONFIG["EMOJI_ROLE_MAP"]
-        LOG_CHANNEL_ID = int(CONFIG.get("LOG_CHANNEL_ID", 0))
-        STATUS_TEXT = CONFIG.get("STATUS_TEXT", "verwaltet Rollen auf dem Server")
-
-        try:
-            await bot.change_presence(
-                activity=discord.Game(name=STATUS_TEXT)
-            )
-        except Exception as e:
-            logging.error(f"Konnte Präsenz nach reload nicht setzen: {e}")
-
-        msg = "Config neu geladen. ROLE_MESSAGE_ID, EMOJI_ROLE_MAP, LOG_CHANNEL_ID und STATUS_TEXT aktualisiert."
-        await ctx.send(msg)
-        logging.info(msg)
-        await log_to_channel(f"🔁 {msg}")
+        await reload_config_internal()
+        await ctx.send("Config neu geladen (ROLE_MESSAGE_ID, EMOJI_ROLE_MAP, LOG_CHANNEL_ID, STATUS_TEXT).")
     except Exception as e:
         logging.error(f"Fehler beim Neuladen der Config: {e}")
         await ctx.send(f"Fehler beim Neuladen der Config: `{e}`")
@@ -271,15 +285,21 @@ async def reload_roles(ctx: commands.Context):
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard_root(key: str | None = None):
-    """Einfache HTML-Übersicht."""
+    """HTML-Dashboard mit Buttons & Mapping-Editor."""
     check_dashboard_key(key)
 
     bot_name = bot.user.name if bot.user else "ReactionBot"
     guild_count = len(bot.guilds) if bot.guilds else 0
 
-    rows = ""
+    rows_servers = ""
     for g in bot.guilds:
-        rows += f"<tr><td>{g.id}</td><td>{g.name}</td><td>{g.member_count}</td></tr>"
+        rows_servers += f"<tr><td>{g.id}</td><td>{g.name}</td><td>{g.member_count}</td></tr>"
+
+    rows_mapping = ""
+    for e, rid in EMOJI_ROLE_MAP.items():
+        rows_mapping += f"<tr><td>{e}</td><td>{rid}</td></tr>"
+
+    suffix = f"?key={key}" if key else ""
 
     html = f"""
     <!DOCTYPE html>
@@ -296,7 +316,7 @@ def dashboard_root(key: str | None = None):
           padding: 32px;
         }}
         .wrap {{
-          max-width: 900px;
+          max-width: 1000px;
           margin: 0 auto;
         }}
         h1 {{
@@ -327,6 +347,63 @@ def dashboard_root(key: str | None = None):
           padding: 2px 4px;
           border-radius: 4px;
         }}
+        .grid {{
+          display: grid;
+          grid-template-columns: 2fr 1fr;
+          gap: 18px;
+          margin-top: 20px;
+        }}
+        .card {{
+          border: 1px solid #2a223f;
+          border-radius: 10px;
+          padding: 14px 16px;
+          background: #11091f;
+        }}
+        .card h2 {{
+          margin-top: 0;
+          margin-bottom: 8px;
+        }}
+        .btn {{
+          display: inline-block;
+          margin-right: 8px;
+          margin-top: 4px;
+          padding: 6px 10px;
+          border-radius: 6px;
+          border: none;
+          cursor: pointer;
+          font-size: 13px;
+        }}
+        .btn-primary {{
+          background: #7b5cff;
+          color: #fff;
+        }}
+        .btn-danger {{
+          background: #ff4a4a;
+          color: #fff;
+        }}
+        .btn-secondary {{
+          background: #25203c;
+          color: #fff;
+        }}
+        input[type="text"] {{
+          width: 100%;
+          padding: 6px 8px;
+          border-radius: 6px;
+          border: 1px solid #2a223f;
+          background: #120c22;
+          color: #fff;
+          font-size: 13px;
+          margin-bottom: 6px;
+        }}
+        label {{
+          font-size: 13px;
+          display: block;
+          margin-top: 4px;
+          margin-bottom: 2px;
+        }}
+        small {{
+          color: #8c86a8;
+        }}
       </style>
     </head>
     <body>
@@ -334,20 +411,51 @@ def dashboard_root(key: str | None = None):
         <h1>{bot_name} – Dashboard</h1>
         <p>Verbunden mit <strong>{guild_count}</strong> Server(n).</p>
 
-        <h2>Status</h2>
-        <p>ROLE_MESSAGE_ID: <code>{ROLE_MESSAGE_ID}</code></p>
+        <div class="grid">
+          <div class="card">
+            <h2>Status</h2>
+            <p>ROLE_MESSAGE_ID: <code>{ROLE_MESSAGE_ID}</code></p>
 
-        <h2>Emoji → Rollen-Mapping</h2>
-        <table>
-          <tr><th>Emoji</th><th>Rollen-ID</th></tr>
-          {''.join(f"<tr><td>{e}</td><td>{rid}</td></tr>" for e, rid in EMOJI_ROLE_MAP.items())}
-        </table>
+            <form method="post" action="/action/reload{suffix}" style="display:inline;">
+              <button class="btn btn-primary" type="submit">Config neu laden</button>
+            </form>
 
-        <h2>Server</h2>
-        <table>
-          <tr><th>ID</th><th>Name</th><th>Member</th></tr>
-          {rows or "<tr><td colspan='3'>Bot ist aktuell auf keinem Server.</td></tr>"}
-        </table>
+            <form method="post" action="/action/restart{suffix}" style="display:inline;">
+              <button class="btn btn-danger" type="submit" onclick="return confirm('Bot wirklich neu starten?')">Bot neu starten</button>
+            </form>
+
+            <h2 style="margin-top:18px;">Emoji → Rollen-Mapping</h2>
+            <table>
+              <tr><th>Emoji</th><th>Rollen-ID</th></tr>
+              {rows_mapping or "<tr><td colspan='2'>Kein Mapping definiert.</td></tr>"}
+            </table>
+
+            <h3 style="margin-top:16px;">Mapping hinzufügen</h3>
+            <form method="post" action="/mapping/add{suffix}">
+              <label>Emoji</label>
+              <input type="text" name="emoji" placeholder="z. B. 🎮" required />
+              <label>Rollen-ID</label>
+              <input type="text" name="role_id" placeholder="Discord Rollen-ID" required />
+              <button class="btn btn-secondary" type="submit">Speichern</button>
+            </form>
+
+            <h3 style="margin-top:16px;">Mapping löschen</h3>
+            <form method="post" action="/mapping/remove{suffix}">
+              <label>Emoji</label>
+              <input type="text" name="emoji" placeholder="Emoji genau wie oben" required />
+              <button class="btn btn-secondary" type="submit">Löschen</button>
+            </form>
+            <small>Änderungen werden in <code>config.json</code> geschrieben.</small>
+          </div>
+
+          <div class="card">
+            <h2>Server</h2>
+            <table>
+              <tr><th>ID</th><th>Name</th><th>Member</th></tr>
+              {rows_servers or "<tr><td colspan='3'>Bot ist aktuell auf keinem Server.</td></tr>"}
+            </table>
+          </div>
+        </div>
       </div>
     </body>
     </html>
@@ -374,6 +482,76 @@ def api_status(key: str | None = None):
         "emoji_role_map": EMOJI_ROLE_MAP,
     }
     return JSONResponse(content=data)
+
+
+@app.post("/action/reload", response_class=HTMLResponse)
+async def dashboard_reload(key: str | None = None):
+    """Config per Dashboard neu laden."""
+    check_dashboard_key(key)
+    await reload_config_internal()
+    target = f"/?key={key}" if key else "/"
+    return RedirectResponse(url=target, status_code=303)
+
+
+@app.post("/action/restart", response_class=HTMLResponse)
+async def dashboard_restart(key: str | None = None):
+    """Bot per Dashboard neustarten (Railway kill + Restart)."""
+    check_dashboard_key(key)
+
+    # Bot in ~1 Sekunde hart beenden, Railway startet Container neu
+    asyncio.get_event_loop().call_later(1, os._exit, 0)
+
+    html = """
+    <!DOCTYPE html>
+    <html lang="de">
+    <head><meta charset="UTF-8" /><title>Restart</title></head>
+    <body style="background:#0b0714;color:#fff;font-family:system-ui;padding:32px;">
+      <h1>Bot-Restart ausgelöst</h1>
+      <p>Der Container wird beendet und von Railway neu gestartet. In ein paar Sekunden ist der Bot wieder online.</p>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+@app.post("/mapping/add")
+async def dashboard_add_mapping(
+    emoji: str = Form(...),
+    role_id: str = Form(...),
+    key: str | None = None
+):
+    """Emoji→Rolle Mapping hinzufügen."""
+    check_dashboard_key(key)
+    emoji = emoji.strip()
+    role_id = role_id.strip()
+
+    if not emoji or not role_id:
+        raise HTTPException(status_code=400, detail="Emoji und Rollen-ID dürfen nicht leer sein.")
+
+    EMOJI_ROLE_MAP[emoji] = role_id
+    save_config()
+    await log_to_channel(f"⚙️ Mapping hinzugefügt: {emoji} → {role_id}")
+
+    target = f"/?key={key}" if key else "/"
+    return RedirectResponse(url=target, status_code=303)
+
+
+@app.post("/mapping/remove")
+async def dashboard_remove_mapping(
+    emoji: str = Form(...),
+    key: str | None = None
+):
+    """Emoji→Rolle Mapping entfernen."""
+    check_dashboard_key(key)
+    emoji = emoji.strip()
+
+    if emoji in EMOJI_ROLE_MAP:
+        removed = EMOJI_ROLE_MAP.pop(emoji)
+        save_config()
+        await log_to_channel(f"⚙️ Mapping entfernt: {emoji} (Rolle {removed})")
+
+    target = f"/?key={key}" if key else "/"
+    return RedirectResponse(url=target, status_code=303)
 
 
 # --- Start / Main ---
