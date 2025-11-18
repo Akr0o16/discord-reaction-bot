@@ -1,9 +1,14 @@
 import os
 import json
 import logging
+import threading
 
 import discord
 from discord.ext import commands
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+import uvicorn
 
 # --- Logging ---
 logging.basicConfig(
@@ -21,6 +26,8 @@ EMOJI_ROLE_MAP = CONFIG["EMOJI_ROLE_MAP"]  # { "🎮": 1439..., ... }
 LOG_CHANNEL_ID = int(CONFIG.get("LOG_CHANNEL_ID", 0))  # 0 = deaktiviert
 STATUS_TEXT = CONFIG.get("STATUS_TEXT", "verwaltet Rollen auf dem Server")
 
+DASHBOARD_SECRET = os.getenv("DASHBOARD_SECRET")  # optionaler Zugangsschlüssel für das Web-Dashboard
+
 # --- Intents ---
 intents = discord.Intents.default()
 intents.members = True
@@ -29,6 +36,9 @@ intents.guilds = True
 intents.reactions = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- FastAPI App ---
+app = FastAPI(title="ReactionBot Dashboard")
 
 
 def get_log_channel() -> discord.TextChannel | None:
@@ -50,7 +60,13 @@ async def log_to_channel(message: str):
         logging.error(f"Fehler beim Loggen in Channel: {e}")
 
 
-# --- Events ---
+def check_dashboard_key(key: str | None):
+    """Einfacher Zugriffsschutz für das Dashboard."""
+    if DASHBOARD_SECRET and key != DASHBOARD_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# --- Discord Events ---
 
 @bot.event
 async def on_ready():
@@ -173,7 +189,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         await log_to_channel(f"❌ Fehler beim Rollen entfernen: `{e}`")
 
 
-# --- Commands ---
+# --- Discord Commands ---
 
 @bot.command()
 async def ping(ctx: commands.Context):
@@ -185,7 +201,7 @@ async def ping(ctx: commands.Context):
 async def setup_roles(ctx: commands.Context):
     """
     Sendet eine neue Rollen-Nachricht inkl. Reaktionen.
-    Die ID musst du danach in config.json eintragen (ROLE_MESSAGE_ID) und !reload_roles ausführen.
+    Die ID musst du danach in config.json eintragen und !reload_roles ausführen.
     """
     description_lines = []
     for emoji, role_id in EMOJI_ROLE_MAP.items():
@@ -193,7 +209,6 @@ async def setup_roles(ctx: commands.Context):
             role_id_int = int(role_id)
         except ValueError:
             continue
-        # Rolle im Text als Mention anzeigen
         description_lines.append(f"{emoji} → <@&{role_id_int}>")
     description = "\n".join(description_lines)
 
@@ -252,12 +267,133 @@ async def reload_roles(ctx: commands.Context):
         await log_to_channel(f"❌ Fehler beim Neuladen der Config: `{e}`")
 
 
-# --- Start ---
+# --- FastAPI Routes ---
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard_root(key: str | None = None):
+    """Einfache HTML-Übersicht."""
+    check_dashboard_key(key)
+
+    bot_name = bot.user.name if bot.user else "ReactionBot"
+    guild_count = len(bot.guilds) if bot.guilds else 0
+
+    rows = ""
+    for g in bot.guilds:
+        rows += f"<tr><td>{g.id}</td><td>{g.name}</td><td>{g.member_count}</td></tr>"
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="de">
+    <head>
+      <meta charset="UTF-8" />
+      <title>{bot_name} – Dashboard</title>
+      <style>
+        body {{
+          font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          background: #0b0714;
+          color: #fff;
+          margin: 0;
+          padding: 32px;
+        }}
+        .wrap {{
+          max-width: 900px;
+          margin: 0 auto;
+        }}
+        h1 {{
+          margin-bottom: 6px;
+        }}
+        p {{
+          color: #c3c3d8;
+          margin-bottom: 14px;
+        }}
+        table {{
+          width: 100%;
+          border-collapse: collapse;
+          margin-top: 16px;
+          font-size: 14px;
+        }}
+        th, td {{
+          border: 1px solid #2a223f;
+          padding: 6px 8px;
+        }}
+        th {{
+          background: #1a1330;
+        }}
+        tr:nth-child(even) {{
+          background: #120c22;
+        }}
+        code {{
+          background: #1a1330;
+          padding: 2px 4px;
+          border-radius: 4px;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="wrap">
+        <h1>{bot_name} – Dashboard</h1>
+        <p>Verbunden mit <strong>{guild_count}</strong> Server(n).</p>
+
+        <h2>Status</h2>
+        <p>ROLE_MESSAGE_ID: <code>{ROLE_MESSAGE_ID}</code></p>
+
+        <h2>Emoji → Rollen-Mapping</h2>
+        <table>
+          <tr><th>Emoji</th><th>Rollen-ID</th></tr>
+          {''.join(f"<tr><td>{e}</td><td>{rid}</td></tr>" for e, rid in EMOJI_ROLE_MAP.items())}
+        </table>
+
+        <h2>Server</h2>
+        <table>
+          <tr><th>ID</th><th>Name</th><th>Member</th></tr>
+          {rows or "<tr><td colspan='3'>Bot ist aktuell auf keinem Server.</td></tr>"}
+        </table>
+      </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
+
+@app.get("/status", response_class=JSONResponse)
+def api_status(key: str | None = None):
+    """JSON-Status für schnelle Checks."""
+    check_dashboard_key(key)
+
+    data = {
+        "bot": str(bot.user) if bot.user else None,
+        "bot_id": bot.user.id if bot.user else None,
+        "guilds": [
+            {
+                "id": g.id,
+                "name": g.name,
+                "member_count": g.member_count
+            } for g in bot.guilds
+        ],
+        "role_message_id": ROLE_MESSAGE_ID,
+        "emoji_role_map": EMOJI_ROLE_MAP,
+    }
+    return JSONResponse(content=data)
+
+
+# --- Start / Main ---
+
+def start_dashboard_server():
+    port = int(os.getenv("PORT", "8000"))  # Railway übergibt PORT
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    server.run()
+
 
 def main():
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise RuntimeError("Umgebungsvariable DISCORD_TOKEN ist nicht gesetzt.")
+
+    # FastAPI Dashboard im Hintergrund starten
+    threading.Thread(target=start_dashboard_server, daemon=True).start()
+
+    # Discord-Bot starten (blockierend)
     bot.run(token)
 
 
